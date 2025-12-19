@@ -1,0 +1,333 @@
+# CÓDIGO DE PROGRAMACIÓN PARA POST PROCESAMIENTO DE MÁSCARAS DE TOMOSÍNTESIS MAMARIA
+# PROCESO DE EROSIÓN Y FILTRADO
+import numpy as np
+import nibabel as nib
+import os
+import json
+import csv
+from scipy.ndimage import binary_erosion, zoom 
+from typing import List, Dict, Any
+  # =================================================================
+  # FUNCIÓN DE CÁLCULO CON GUARDADO Y FIX DE DIMENSIONES
+  # =================================================================
+def procesar_mascara_y_calcular_densidad(
+    ruta_label1_predicha: str,
+    ruta_label2_gt_mama: str,
+    output_path_base: str, # Nueva ruta base para guardar la máscara
+    volumen_voxel_cc: float,
+    erod_structure: np.ndarray,
+    erod_iterations: int
+) -> Dict[str, Any]:
+    """Procesa la máscara TFG, la guarda, y calcula V_Mama, V_TFG y Densidad Mamaria."""    
+    # 1. Verificación de existencia de archivos
+    if not os.path.exists(ruta_label1_predicha):
+        return {"error": f"Archivo label1 no encontrado: {os.path.basename(ruta_label1_predicha)}"}
+    if not os.path.exists(ruta_label2_gt_mama):
+        return {"error": f"Archivo label2 no encontrado: {os.path.basename(ruta_label2_gt_mama)}"}        
+    # 2. Carga, Normalización y Resampling
+    try:
+        # Cargar objetos NIfTI para obtener el AFFINE (crucial para guardar correctamente)
+        label1_nii = nib.load(ruta_label1_predicha)
+        label2_nii = nib.load(ruta_label2_gt_mama)        
+        label1_data = label1_nii.get_fdata()
+        mama_gt_np = (label2_nii.get_fdata() > 0).astype(np.uint8)
+        if label1_data.ndim == 4 and label1_data.shape[-1] > 1:
+            tfg_predicho_np = label1_data[..., 1] 
+            # print(f"    -> FIX: Se colapsó la máscara label1 de {label1_data.shape} a {tfg_predicho_np.shape} (Clase 1).")
+        else:
+            tfg_predicho_np = label1_data            
+        tfg_predicho_np = (tfg_predicho_np > 0).astype(np.uint8)
+        tfg_procesada_np = tfg_predicho_np.copy() 
+        if tfg_predicho_np.shape != mama_gt_np.shape:
+             
+             print(f"    -> ADVERTENCIA: Dimensiones 3D no coinciden. Resampleando label1 ({tfg_predicho_np.shape}) a label2 ({mama_gt_np.shape}).")
+             
+             zoom_factors = [target_dim / source_dim for target_dim, source_dim in zip(mama_gt_np.shape, tfg_predicho_np.shape)]             
+             tfg_procesada_np = zoom(
+                 tfg_predicho_np, 
+                 zoom=zoom_factors, 
+                 order=0, mode='nearest', prefilter=False
+             ).astype(np.uint8)
+             if tfg_procesada_np.shape != mama_gt_np.shape:
+                 tfg_procesada_np = tfg_procesada_np[:mama_gt_np.shape[0], :mama_gt_np.shape[1], :mama_gt_np.shape[2]]
+                 
+             if tfg_procesada_np.shape != mama_gt_np.shape:
+                 return {"error": f"Fallo en resampling final: {tfg_procesada_np.shape} vs GT {mama_gt_np.shape}."}
+    except Exception as e:
+        return {"error": f"Error al leer/procesar NIfTI: {e}"}    
+    # 3. GUARDAR LA MÁSCARA TFG PROCESADA 
+    output_filename = os.path.basename(output_path_base)
+    output_filepath = os.path.join(output_mask_dir, output_filename)    
+    tfg_procesada_nii = nib.Nifti1Image(tfg_procesada_np, label2_nii.affine)
+    nib.save(tfg_procesada_nii, output_filepath)
+    # print(f"    -> Máscara TFG procesada guardada en: {output_filepath}")
+    # 4. Cálculo de Densidad
+    mama_erosionada = binary_erosion(
+        mama_gt_np, 
+        structure=erod_structure, 
+        iterations=erod_iterations
+    ).astype(np.uint8)    
+    tfg_filtrado_np = tfg_procesada_np * mama_erosionada
+    voxeles_mama = np.sum(mama_gt_np)
+    voxeles_tfg = np.sum(tfg_filtrado_np)
+    if voxeles_mama == 0:
+        return {"error": "Máscara de la mama (label2) es vacía."}    
+    vol_mama_cc = voxeles_mama * volumen_voxel_cc
+    vol_tfg_cc = voxeles_tfg * volumen_voxel_cc    
+    densidad_mamaria_porc = (vol_tfg_cc / vol_mama_cc) * 100
+    return {
+        "V_Mama_cc": vol_mama_cc,
+        "V_TFG_cc": vol_tfg_cc,
+        "Densidad_Mamaria_porc": densidad_mamaria_porc
+    }
+
+  # ==============================================
+  # FUNCIÓN PRINCIPAL DE PROCESAMIENTO POR LOTE 
+  # ==============================================
+
+def procesar_lote_y_guardar_resultados(
+    data_dir: str, 
+    split_json_filename: str, 
+    output_mask_dir: str, 
+    volumen_voxel_cc: float):
+    """Coordina la carga, procesamiento, guardado de máscara y cálculo de resultados."""
+    os.makedirs(output_mask_dir, exist_ok=True)
+    json_path = os.path.join(data_dir, split_json_filename)  
+    try:
+        with open(json_path, 'r') as f:
+            data_content = json.load(f) 
+    except Exception as e:
+        print(f"Error al cargar o parsear el JSON en {json_path}: {e}")
+        return
+    data_list_dicts: List[Dict[str, str]] = []    
+    if isinstance(data_content, dict):
+        for key, value in data_content.items():
+            if isinstance(value, list) and all(isinstance(x, dict) for x in value):
+                data_list_dicts.extend(value)
+    if not data_list_dicts:
+        print("Error: No se pudo extraer ninguna lista de diccionarios (registros de pacientes) del JSON.")
+        return
+    resultados_totales: List[Dict[str, Any]] = []
+
+    print(f"Iniciando procesamiento de {len(data_list_dicts)} pacientes/vistas (Cargados desde JSON)...")
+
+    for i, item in enumerate(data_list_dicts):        
+        try:
+            filename_label1 = item["label1"] 
+            filename_label2 = item["label2"] 
+            paciente_id_vista = filename_label1.replace("_seg.nii.gz", "").replace(".nii.gz", "")            
+        except KeyError:
+            continue
+            
+        ruta_label1 = os.path.join(data_dir, filename_label1)
+        ruta_label2 = os.path.join(data_dir, filename_label2)
+        output_filename = f"{paciente_id_vista}_TFG_proc.nii.gz"
+        
+        # 3. Procesar y Calcular la Densidad
+        calculos = procesar_mascara_y_calcular_densidad(
+            ruta_label1_predicha=ruta_label1,
+            ruta_label2_gt_mama=ruta_label2,
+            output_path_base=output_filename,
+            volumen_voxel_cc=volumen_voxel_cc,
+            erod_structure=EROSION_STRUCTURE,
+            erod_iterations=EROSION_ITERATIONS )
+        # 4. Consolidar Resultados
+        resultado_final = {
+            "ID_Vista": paciente_id_vista, 
+            "Archivo_label1_TFG_Predicho": filename_label1, 
+            "Archivo_label2_Mama_GT": filename_label2,
+            "Archivo_TFG_Procesada_Guardada": output_filename # Añadir el nombre de la máscara guardada }
+        resultado_final.update(calculos)
+        resultados_totales.append(resultado_final)
+        if "error" in calculos:
+             print(f"->  Fallo en el cálculo para {paciente_id_vista}: {calculos['error']}")
+        else:
+             print(f"->  Calculado y guardado {paciente_id_vista}. DM: {calculos['Densidad_Mamaria_porc']:.2f}%")
+    # 5. Guardar los resultados en CSV
+    output_csv_path = os.path.join(output_mask_dir, RESULTADOS_FILENAME)
+        if resultados_totales:
+        fieldnames = ["ID_Vista", "Archivo_label1_TFG_Predicho", "Archivo_label2_Mama_GT", 
+                      "Archivo_TFG_Procesada_Guardada", # Nuevo campo en CSV
+                      "V_Mama_cc", "V_TFG_cc", "Densidad_Mamaria_porc", "error"]
+        
+        with open(output_csv_path, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(resultados_totales)62        
+        print(f"\n Proceso completado. Resultados de cálculos y máscaras procesadas guardados en:")
+        print(output_csv_path)
+        print(f"Las máscaras TFG procesadas (.nii.gz) se guardaron en: {output_mask_dir}")
+    else:
+        print("\n❌ No se generaron resultados válidos para guardar.")
+
+  # =================================================================
+  # EJECUCIÓN DEL SCRIPT
+  # =================================================================
+if __name__ == "__main__":
+    procesar_lote_y_guardar_resultados(
+        data_dir=data_dir, 
+        split_json_filename=split_json_filename, 
+        output_mask_dir=output_mask_dir, 
+        volumen_voxel_cc=VOLUMEN_VOXEL_CC)
+
+# PROCESO DE INVERSIÓN
+  # =================================================================
+  # FUNCIÓN: PROCESAR, CALCULAR Y GUARDAR MÁSCARA
+  # =================================================================
+def procesar_mascara_y_calcular_densidad(
+    ruta_label1_predicha: str,
+    ruta_label2_gt_mama: str,
+    output_path_base: str,
+    volumen_voxel_cc: float,
+    erod_structure: np.ndarray,
+    erod_iterations: int
+) -> Dict[str, Any]:
+    """
+    Procesa la máscara TFG (label1) asumiendo que es el complemento (tejido graso),
+    aplica la doble inversión segura, filtra el pectoral y cuantifica.
+    """    
+    if not os.path.exists(ruta_label1_predicha) or not os.path.exists(ruta_label2_gt_mama):
+        return {"error": "Uno o ambos archivos de máscara no se encontraron."}        
+    try:
+        # 1. Cargar y binarizar
+        label1_nii = nib.load(ruta_label1_predicha)
+        label2_nii = nib.load(ruta_label2_gt_mama)        
+        label1_data = label1_nii.get_fdata()
+        mama_gt_np = (label2_nii.get_fdata() > 0).astype(np.uint8)
+        if label1_data.ndim == 4 and label1_data.shape[-1] > 1:
+            # Asume que la clase 1 es el objeto de interés (el Complemento del TFG)
+            tfg_predicho_np = label1_data[..., 1] 
+        else:
+            tfg_predicho_np = label1_data            
+        tfg_predicho_np = (tfg_predicho_np > 0).astype(np.uint8)
+        tfg_procesada_np = tfg_predicho_np.copy()
+        if tfg_predicho_np.shape != mama_gt_np.shape:
+             zoom_factors = [target_dim / source_dim for target_dim, source_dim in zip(mama_gt_np.shape, tfg_predicho_np.shape)]             
+             tfg_procesada_np = zoom(
+                 tfg_predicho_np, 
+                 zoom=zoom_factors, 
+                 order=0, mode='nearest', prefilter=False
+             ).astype(np.uint8)
+             if tfg_procesada_np.shape != mama_gt_np.shape:
+                 tfg_procesada_np = tfg_procesada_np[:mama_gt_np.shape[0], :mama_gt_np.shape[1], :mama_gt_np.shape[2]]
+                 
+             if tfg_procesada_np.shape != mama_gt_np.shape:
+                 return {"error": f"Fallo en resampling final."}        
+              tfg_procesada_np = tfg_procesada_np * mama_gt_np        
+        tfg_logico_np = mama_gt_np - tfg_procesada_np        
+        tfg_final_np = 1 - tfg_logico_np        
+        tfg_procesada_np = tfg_final_np * mama_gt_np
+        tfg_procesada_np = tfg_procesada_np.astype(np.uint8)
+    except Exception as e:
+        return {"error": f"Error al leer/procesar NIfTI: {e}"}    
+    output_filepath = os.path.join(output_mask_dir, os.path.basename(output_path_base))
+    tfg_procesada_nii = nib.Nifti1Image(tfg_procesada_np, label2_nii.affine)
+    nib.save(tfg_procesada_nii, output_filepath)
+    
+    # 9. Cálculo de Densidad
+    
+    mama_erosionada = binary_erosion(
+        mama_gt_np, 
+        structure=erod_structure, 
+        iterations=erod_iterations
+    ).astype(np.uint8)
+    tfg_filtrado_np = tfg_procesada_np * mama_erosionada
+    voxeles_mama = np.sum(mama_gt_np)
+    voxeles_tfg = np.sum(tfg_filtrado_np)    
+    if voxeles_mama == 0:
+        return {"error": "Máscara de la mama (label2) es vacía."}    
+    vol_mama_cc = voxeles_mama * volumen_voxel_cc
+    vol_tfg_cc = voxeles_tfg * volumen_voxel_cc    
+    densidad_mamaria_porc = (vol_tfg_cc / vol_mama_cc) * 100
+    return {
+        "V_Mama_cc": vol_mama_cc,
+        "V_TFG_cc": vol_tfg_cc,
+        "Densidad_Mamaria_porc": densidad_mamaria_porc
+    }
+  # =================================================================
+  # FUNCIÓN PRINCIPAL DE PROCESAMIENTO POR LOTE
+  # =================================================================
+def procesar_lote_y_guardar_resultados(
+    data_dir: str, 
+    split_json_filename: str, 
+    output_mask_dir: str, 
+    volumen_voxel_cc: float):    
+    os.makedirs(output_mask_dir, exist_ok=True)
+    json_path = os.path.join(data_dir, split_json_filename)    
+    try:
+        with open(json_path, 'r') as f:
+            data_content = json.load(f) 
+    except Exception as e:
+        print(f"Error al cargar o parsear el JSON en {json_path}: {e}")
+        return
+    data_list_dicts: List[Dict[str, str]] = []    
+    if isinstance(data_content, dict):
+        for key, value in data_content.items():
+            if isinstance(value, list) and all(isinstance(x, dict) for x in value):
+                data_list_dicts.extend(value)
+    if not data_list_dicts:
+        print("Error: No se pudo extraer ninguna lista de diccionarios (registros de pacientes) del JSON.")
+        return
+    resultados_totales: List[Dict[str, Any]] = []
+    print(f"Iniciando procesamiento de {len(data_list_dicts)} pacientes/vistas (Cargados desde JSON)...")
+    print("--- MODO INVERSIÓN FINAL FORZADA ACTIVO (Doble Inversión Segura) ---")
+
+    for i, item in enumerate(data_list_dicts):
+        
+        try:
+            filename_label1 = item["label1"] 
+            filename_label2 = item["label2"] 
+            paciente_id_vista = filename_label1.replace("_seg.nii.gz", "").replace(".nii.gz", "")
+        except KeyError:
+            continue
+            
+        ruta_label1 = os.path.join(data_dir, filename_label1)
+        ruta_label2 = os.path.join(data_dir, filename_label2)
+        output_filename = f"{paciente_id_vista}_TFG_proc.nii.gz"
+        
+        # 3. Procesar, Calcular y Guardar la Densidad
+        calculos = procesar_mascara_y_calcular_densidad(
+            ruta_label1_predicha=ruta_label1,
+            ruta_label2_gt_mama=ruta_label2,
+            output_path_base=output_filename,
+            volumen_voxel_cc=volumen_voxel_cc,
+            erod_structure=EROSION_STRUCTURE,
+            erod_iterations=EROSION_ITERATIONS)
+
+        # 4. Consolidar Resultados
+        resultado_final = {
+            "ID_Vista": paciente_id_vista, 
+            "Archivo_label1_TFG_Predicho": filename_label1, 
+            "Archivo_label2_Mama_GT": filename_label2,
+            "Archivo_TFG_Procesada_Guardada": output_filename}
+        resultado_final.update(calculos)
+        resultados_totales.append(resultado_final)
+        
+        if "error" in calculos:
+             print(f"-> ❌ Fallo en el cálculo para {paciente_id_vista}: {calculos['error']}")
+        else:
+             print(f"->Calculado y guardado {paciente_id_vista}. DM: {calculos['Densidad_Mamaria_porc']:.2f}% (V_TFG: {calculos['V_TFG_cc']:.2f} cc / V_Mama: {calculos['V_Mama_cc']:.2f} cc)")
+    # 5. Guardar los resultados en CSV
+    output_csv_path = os.path.join(output_mask_dir, RESULTADOS_FILENAME)    
+    if resultados_totales:
+        fieldnames = ["ID_Vista", "Archivo_label1_TFG_Predicho", "Archivo_label2_Mama_GT", 
+                      "Archivo_TFG_Procesada_Guardada", 
+                      "V_Mama_cc", "V_TFG_cc", "Densidad_Mamaria_porc", "error"]
+        with open(output_csv_path, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(resultados_totales)
+        
+        print(f"\n Proceso completado. Resultados de cálculos (DOBLE INVERSIÓN) guardados en:")
+        print(output_csv_path)
+    else:
+        print("\n No se generaron resultados válidos para guardar.")
+  # =============================================================
+  # EJECUCIÓN DEL SCRIPT
+  # =============================================================
+if __name__ == "__main__":
+    procesar_lote_y_guardar_resultados(
+        data_dir=data_dir, 
+        split_json_filename=split_json_filename, 
+        output_mask_dir=output_mask_dir, 
+        volumen_voxel_cc=VOLUMEN_VOXEL_CC)

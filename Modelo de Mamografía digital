@@ -1,0 +1,612 @@
+# CÓDIGO DE PROGRAMACIÓN PARA EL MODELO DE MAMOGRAFÍA DIGITAL
+# TRAINING MODELO NN-UNET
+  # CONFIGURACIÓN DE RUTAS Y PARÁMETROS
+data_dir = "/home/jovyan/Tomosintesis/DataMammo/"
+split_json = "dataset_MXinter.json"
+save_dir = "models_output"
+checkpoints_dir = os.path.join(save_dir, "checkpoints")
+datasets = data_dir + split_json
+  #  PARÁMETROS DEL MODELO Y ENTRENAMIENTO
+size_cube = (128, 128)
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") 
+max_epochs = 600
+val_interval = 10
+initial_lr = 1e-5 
+os.makedirs(checkpoints_dir, exist_ok=True)
+
+  # Clase personalizada para combinar las etiquetas (Clase 0=Fondo, 1=Mama, 2=TFG)
+class CombineLabelsMono(Transform):
+    def __call__(self, data):
+        mask_mama_completa = data["label1"]
+        mask_tfg_solo = data["label2"]
+        out = torch.zeros_like(mask_mama_completa, dtype=torch.uint8)
+        mask_mama_binaria = mask_mama_completa > 0
+        out[mask_mama_binaria] = 1
+        mask_tfg_binaria = mask_tfg_solo > 0
+        out[mask_tfg_binaria] = 2
+        data["label"] = out
+        del data["label1"], data["label2"]
+        return data
+
+class CLAHEd(MapTransform):
+    """
+    Aplicar CLAHE a imágenes, manteniendo exactamente las dimensiones de entrada.
+    """
+
+    def __init__(self, keys, clip_limit=2.0, tile_grid_size=(8, 8), color_range=255):
+        super().__init__(keys)
+        self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+        self.color_range = color_range
+
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.keys:
+            img = d[key]
+            if not isinstance(img, np.ndarray):
+                img = img.numpy()
+            original_shape = img.shape
+            while img.ndim > 2 and (img.shape[0] == 1 or img.shape[-1] == 1):
+                img = np.squeeze(img, axis=0) if img.shape[0] == 1 else np.squeeze(img, axis=-1)
+            if img.ndim != 2:
+                raise ValueError(f"CLAHEd espera imagen 2D para aplicar CLAHE, recibió {img.shape}")
+            #print("color_range",self.color_range)
+            # Convertimos a uint8
+            if img.dtype != np.uint8 and self.color_range == 255:
+                img_norm = (img - img.min()) / (img.max() - img.min() + 1e-8)
+                img_uint = (img_norm * self.color_range).astype(np.uint8)
+            elif img.dtype != np.uint16 and self.color_range != 255:
+                img_norm = (img - img.min()) / (img.max() - img.min() + 1e-8)
+                img_uint = (img_norm * self.color_range).astype(np.uint16)
+            else:
+                img_uint = img
+
+            clahe_img = self.clahe.apply(img_uint)
+            if self.color_range != 255:
+                clahe_img = clahe_img.astype(np.float32) / 65535.0 * self.color_range
+            	clahe_img = clahe_img.reshape(original_shape)
+            d[key] = clahe_img
+        return d
+  # Función para encontrar archivos 
+def find_valid_file(nombre_archivo, base_path):
+    posibles_rutas = []
+    if nombre_archivo.endswith(".nii") or nombre_archivo.endswith(".nii.gz"):
+        posibles_rutas.append(nombre_archivo)
+    else:
+        posibles_rutas.extend([nombre_archivo + ".nii", nombre_archivo + ".nii.gz"])
+
+    for ruta_relativa in posibles_rutas:
+        ruta_abs = os.path.join(base_path, ruta_relativa)
+        if os.path.exists(ruta_abs):
+            return ruta_abs
+    return None
+train_files = load_decathlon_datalist(datasets, True, "training")
+train_files_pre = []
+for item in train_files:
+    try:
+        nuevo_item = {}
+        for key in ["image", "label1", "label2"]:
+            nombre = item[key].strip()
+            ruta_valida = find_valid_file(nombre, data_dir)
+            if ruta_valida is None:
+                raise FileNotFoundError(f"No se encontró archivo válido para: {nombre}")
+            nuevo_item[key] = ruta_valida
+            
+        train_files_pre.append(nuevo_item)
+        
+    except (FileNotFoundError, KeyError) as e:
+        print(f"❌ Error al procesar la entrada: {item} -> {e}. Esta entrada será omitida.")
+        
+if len(train_files_pre) == 0:
+    raise ValueError("No se encontraron archivos válidos para entrenamiento. Revisa tus rutas en el JSON.")
+
+train_files, val_files = train_test_split(train_files_pre, test_size=0.2, random_state=42)
+print(f" Muestras de entrenamiento: {len(train_files)}")
+print(f" Muestras de validación: {len(val_files)}")
+# Definición de las transformaciones 
+train_transforms = Compose([
+    LoadImaged(keys=["image", "label1", "label2"]),
+    EnsureChannelFirstd(keys=["image", "label1", "label2"]),
+    CLAHEd(keys=["image"], clip_limit=2.0, tile_grid_size=(8,8)),
+    CombineLabelsMono(),
+    ScaleIntensityRanged(
+        keys=["image"],
+        a_min=0, a_max=255,
+        b_min=0.0, b_max=1.0,
+        clip=True,
+    ),
+    CropForegroundd(keys=["image", "label"], source_key="image", allow_missing_keys=True),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
+    SqueezeDimd(keys=["image","label"], dim=-1),
+    RandCropByPosNegLabeld(
+        keys=["image", "label"],
+        label_key="label",
+        spatial_size=size_cube,
+        pos=0.75, neg=0.25,
+        num_samples=20,
+        image_key="image", image_threshold=0,
+    ),
+])
+val_transforms = Compose( [ 
+    LoadImaged(keys=["image", "label1", "label2"]), 
+    EnsureChannelFirstd(keys=["image", "label1", "label2"]), 
+    CLAHEd(keys=["image"], clip_limit=2.0, tile_grid_size=(8,8), color_range=255), 
+    CombineLabelsMono(), 
+    ScaleIntensityRanged(
+        keys=["image"],
+        a_min=0, a_max=255,
+        b_min=0.0, b_max=1.0,
+        clip=True,
+    ),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1), 
+    SqueezeDimd(keys=["image","label"], dim=-1),
+    CropForegroundd(keys=["image", "label"], source_key="image", allow_missing_keys=True)
+     ])
+train_ds = Dataset(data=train_files, transform=train_transforms)
+train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
+
+val_ds = Dataset(data=val_files, transform=val_transforms)
+val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
+
+  # ---------------------------------------------------------------------
+  # --- MODELO, PÉRDIDA, OPTIMIZADOR Y CONGELACIÓN 
+  # ---------------------------------------------------------------------
+model = DynUNet(
+    spatial_dims=2,
+    in_channels=1,
+    out_channels=3,  # Fondo (0), Mama (1), TFG (2)
+    kernel_size = [[3, 3]] * 5,
+    strides = [[1, 1], [2, 2], [2, 2], [2, 2], [2, 2]],    
+    upsample_kernel_size=[[2, 2]] * 4,
+    norm_name="batch",
+    act_name="softmax",
+    deep_supervision=False,
+    filters=(16, 32, 64, 128, 256, 512)
+).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr)
+# Función de pérdida
+weights = torch.tensor([1.0, 1.0, 2.0], dtype=torch.float32).to(device) 
+loss_function = DiceCELoss(
+    include_background=True,
+    to_onehot_y=True,
+    softmax=True,      # aplica softmax dentro
+    lambda_dice=1.0,
+    lambda_ce=1.0,
+    weight=weights
+)
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print("-" * 10)
+print(f"Total de parámetros del modelo: {total_params}")
+print(f"Parámetros entrenables: {trainable_params}")
+print(f"Porcentaje de parámetros entrenables: {100 * trainable_params / total_params:.2f}%")
+print("-" * 10)
+
+  # ---------------------------------------------------------------------
+  # --- BUCLE DE ENTRENAMIENTO Y VALIDACIÓN --- (Se mantiene igual)
+  # ---------------------------------------------------------------------
+loss_function_val = DiceCELoss(to_onehot_y=True, softmax=True, include_background=False) 
+dice_metric_avg = DiceMetric(include_background=False, reduction="mean")
+dice_metric_per_class = DiceMetric(include_background=False, reduction="none")
+post_pred = Compose([AsDiscrete(argmax=True, to_onehot=3)])
+post_label = Compose([AsDiscrete(to_onehot=3)])
+best_metric = -1
+best_metric_epoch = -1
+epoch_loss_values = []
+metric_values = []
+val_dice_avg_values = []
+val_dice_mama_values = []
+val_dice_tfg_values = []
+val_epoch_loss_values = []
+scaler = GradScaler()
+gc.collect()
+torch.cuda.empty_cache()
+print("Iniciando reentrenamiento...")
+for epoch in range(max_epochs):
+    print("-" * 10)
+    print(f"epoch {epoch + 1}/{max_epochs}")
+    model.train()
+    epoch_loss = 0
+    step = 0
+    # BUCLE DE ENTRENAMIENTO
+    for batch_data in train_loader:
+    #for batch_data in val_loader:
+        step += 1
+        inputs, labels = batch_data["image"].to(device), batch_data["label"].to(device)
+             optimizer.zero_grad()        
+        # Retropropagación
+        outputs = model(inputs)
+        loss = loss_function(outputs, labels) # Usando la pérdida ponderada
+        
+        loss.backward()
+        optimizer.step()
+        
+        epoch_loss += loss.item()
+
+    epoch_loss /= step
+    epoch_loss_values.append(epoch_loss)
+    print(f"epoch {epoch + 1} average loss: {epoch_loss:.4f}")
+    torch.cuda.empty_cache()
+       if (epoch + 1) % val_interval == 0:
+        model.eval() 
+        dice_metric_avg.reset()
+        dice_metric_per_class.reset()
+        
+        val_epoch_loss = 0
+        val_step = 0
+        
+        with torch.no_grad():
+            for val_data in val_loader:
+                val_step += 1
+                val_inputs = val_data["image"].to(device) 
+                val_labels = val_data["label"].to(device)
+                roi_size = size_cube
+                sw_batch_size = 1
+                
+                val_outputs = sliding_window_inference(val_inputs, roi_size, sw_batch_size, model)
+                val_loss = loss_function_val(val_outputs, val_labels) 
+                val_epoch_loss += val_loss.item()
+                val_outputs_processed = [post_pred(i) for i in decollate_batch(val_outputs)]
+                val_labels_processed = [post_label(i) for i in decollate_batch(val_labels)]
+
+                dice_metric_avg(y_pred=val_outputs_processed, y=val_labels_processed)
+                dice_metric_per_class(y_pred=val_outputs_processed, y=val_labels_processed)
+
+            val_epoch_loss /= val_step
+            val_epoch_loss_values.append(val_epoch_loss)
+            metric = dice_metric_avg.aggregate().item()
+            metric_per_class = dice_metric_per_class.aggregate()
+            metric_mama = metric_per_class[0].mean().item() if len(metric_per_class) > 0 else 0
+            metric_tfg = metric_per_class[1].mean().item() if len(metric_per_class) > 1 else 0
+            dice_metric_avg.reset()
+            dice_metric_per_class.reset()
+            metric_values.append(metric)
+            val_dice_avg_values.append(metric) 
+            val_dice_mama_values.append(metric_mama)
+            val_dice_tfg_values.append(metric_tfg)
+
+            if metric > best_metric:
+                best_metric = metric
+                best_metric_epoch = epoch + 1
+                best_model_path_new = os.path.join(save_dir, f"best_model_epoch_{epoch + 1}_dice_{metric:.4f}.pth")
+                torch.save(model.state_dict(), best_model_path_new)
+            print(f" Nuevo mejor modelo guardado: {best_model_path_new}")
+        model_path_new = os.path.join(checkpoints_dir, f"model_epoch_{epoch + 1}.pth")
+        torch.save(model.state_dict(), model_path_new)
+        print(f"Pérdida de Validación (Sin Fondo): {val_epoch_loss:.4f}")
+        print(f"Métrica de Validación Promedio (Sin Fondo): {metric:.4f}")
+        print(f"Dice Mama (Clase 1): {metric_mama:.4f}")
+        print(f"Dice TFG (Clase 2): {metric_tfg:.4f}")
+        model.train() 
+        torch.cuda.empty_cache()         
+print(f"\n Mejor Dice: {best_metric:.4f} en la época {best_metric_epoch}")
+    
+df_train = pd.DataFrame({"epoch": list(range(1, len(epoch_loss_values) + 1)), "train_loss": epoch_loss_values})
+df_train.to_csv(os.path.join(save_dir, "train_metrics.csv"), index=False)
+val_epochs = list(range(val_interval, (len(val_dice_avg_values) * val_interval) + 1, val_interval))
+df_val = pd.DataFrame({
+    "epoch": val_epochs,
+    "val_dice_avg": val_dice_avg_values,
+    "val_dice_mama": val_dice_mama_values,
+    "val_dice_tfg": val_dice_tfg_values,
+    "val_epoch_loss": val_epoch_loss_values
+})
+df_val.to_csv(os.path.join(save_dir, "val_metrics.csv"), index=False)
+torch.save(model.state_dict(), os.path.join(save_dir, "final_model.pth"))
+print(" Modelo final guardado")
+
+# FINE-TUNING DEL MODELO
+  # CONFIGURACIÓN DE RUTAS Y PARÁMETROS
+data_dir = "/home/jovyan/Tomosintesis/DataTOMOHCUCH/"
+split_json = "dataset_MX (no label3).json"
+save_dir = "finetuning_output"
+checkpoints_dir = os.path.join(save_dir, "checkpoints")
+
+datasets = data_dir + split_json
+  # PARÁMETROS DEL MODELO Y ENTRENAMIENTO
+size_cube = (128, 128) # Tamaño del parche
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") 
+max_epochs = 600
+val_interval = 10
+initial_lr = 1e-5 
+model_filename = os.path.join(data_dir, "best_model_epoch_570_dice_0-Copy1.7813.pth") 
+  # CREACIÓN DE DIRECTORIOS
+os.makedirs(checkpoints_dir, exist_ok=True)
+  # Clase personalizada para combinar las etiquetas (Clase 0=Fondo, 1=Mama, 2=TFG)
+class CombineLabelsMono(Transform):
+    def __call__(self, data):
+        mask_mama_completa = data["label1"]
+        mask_tfg_solo = data["label2"]
+        if isinstance(mask_mama_completa, np.ndarray):
+            mask_mama_completa = torch.from_numpy(mask_mama_completa)
+        if isinstance(mask_tfg_solo, np.ndarray):
+            mask_tfg_solo = torch.from_numpy(mask_tfg_solo)
+        mask_mama_completa = mask_mama_completa.float()
+        mask_tfg_solo = mask_tfg_solo.float()
+        if mask_mama_completa.numel() == 1:
+            mask_mama_completa = torch.zeros_like(mask_tfg_solo)
+        while mask_mama_completa.ndim < mask_tfg_solo.ndim:
+            mask_mama_completa = mask_mama_completa.unsqueeze(0)
+        while mask_tfg_solo.ndim < mask_mama_completa.ndim:
+            mask_tfg_solo = mask_tfg_solo.unsqueeze(0)
+        if mask_mama_completa.shape != mask_tfg_solo.shape:
+            mask_mama_completa = torch.nn.functional.interpolate(
+                mask_mama_completa.unsqueeze(0),
+                size=mask_tfg_solo.shape[-2:],
+                mode="nearest"
+            ).squeeze(0)
+        out = torch.zeros_like(mask_tfg_solo, dtype=torch.uint8)
+        mask_mama_binaria = mask_mama_completa > 0
+        out[mask_mama_binaria] = 1
+        mask_tfg_binaria = mask_tfg_solo > 0
+        out[mask_tfg_binaria] = 2
+        data["label"] = out
+        del data["label1"], data["label2"]
+        return data
+class CLAHEd(MapTransform):
+    """
+    Aplicar CLAHE a imágenes, manteniendo exactamente las dimensiones de entrada.
+    """
+    def __init__(self, keys, clip_limit=2.0, tile_grid_size=(8, 8), color_range=255):
+        super().__init__(keys)
+        self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+        self.color_range = color_range
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.keys:
+            img = d[key]
+            if not isinstance(img, np.ndarray):
+                img = img.numpy()
+            original_shape = img.shape
+            while img.ndim > 2 and (img.shape[0] == 1 or img.shape[-1] == 1):
+                img = np.squeeze(img, axis=0) if img.shape[0] == 1 else np.squeeze(img, axis=-1)
+            if img.ndim != 2:
+                raise ValueError(f"CLAHEd espera imagen 2D para aplicar CLAHE, recibió {img.shape}")
+            if img.dtype != np.uint8 and self.color_range == 255:
+                img_norm = (img - img.min()) / (img.max() - img.min() + 1e-8)
+                img_uint = (img_norm * self.color_range).astype(np.uint8)
+            elif img.dtype != np.uint16 and self.color_range != 255:
+                img_norm = (img - img.min()) / (img.max() - img.min() + 1e-8)
+                img_uint = (img_norm * self.color_range).astype(np.uint16)
+            else:
+                img_uint = img
+            clahe_img = self.clahe.apply(img_uint)
+            if self.color_range != 255:
+                clahe_img = clahe_img.astype(np.float32) / 65535.0 * self.color_range
+            clahe_img = clahe_img.reshape(original_shape)
+            d[key] = clahe_img
+        return d
+def find_valid_file(nombre_archivo, base_path):
+    posibles_rutas = []
+    if nombre_archivo.endswith(".nii") or nombre_archivo.endswith(".nii.gz"):
+        posibles_rutas.append(nombre_archivo)
+    else:
+        posibles_rutas.extend([nombre_archivo + ".nii", nombre_archivo + ".nii.gz"])
+    for ruta_relativa in posibles_rutas:
+        ruta_abs = os.path.join(base_path, ruta_relativa)
+        if os.path.exists(ruta_abs):
+            return ruta_abs
+    return None
+train_files = load_decathlon_datalist(datasets, True, "training")
+train_files_pre = []
+for item in train_files:
+    try:
+        nuevo_item = {}
+        for key in ["image", "label1", "label2"]:
+            nombre = item[key].strip()
+            ruta_valida = find_valid_file(nombre, data_dir)
+            if ruta_valida is None:
+                raise FileNotFoundError(f"No se encontró archivo válido para: {nombre}")
+            nuevo_item[key] = ruta_valida    
+       train_files_pre.append(nuevo_item)        
+    except (FileNotFoundError, KeyError) as e:
+        print(f" Error al procesar la entrada: {item} -> {e}. Esta entrada será omitida.")        
+if len(train_files_pre) == 0:
+    raise ValueError("No se encontraron archivos válidos para entrenamiento. Revisa tus rutas en el JSON.")
+train_files, val_files = train_test_split(train_files_pre, test_size=0.2, random_state=42)
+print(f" Muestras de entrenamiento: {len(train_files)}")
+print(f" Muestras de validación: {len(val_files)}") 
+train_transforms = Compose([
+    LoadImaged(keys=["image", "label1", "label2"]),
+    EnsureChannelFirstd(keys=["image", "label1", "label2"]),
+    CLAHEd(keys=["image"], clip_limit=2.0, tile_grid_size=(8,8)),
+    CombineLabelsMono(),
+    ScaleIntensityRanged(
+        keys=["image"],
+        a_min=0, a_max=255,
+        b_min=0.0, b_max=1.0,
+        clip=True,
+    ),
+    CropForegroundd(keys=["image", "label"], source_key="image", allow_missing_keys=True),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
+    SqueezeDimd(keys=["image","label"], dim=-1),
+    RandCropByPosNegLabeld(
+        keys=["image", "label"],
+        label_key="label",
+        spatial_size=size_cube,
+        pos=0.75, neg=0.25,
+        num_samples=20,
+        image_key="image", image_threshold=0,
+    ),
+])
+val_transforms = Compose( [ 
+    LoadImaged(keys=["image", "label1", "label2"]), 
+    EnsureChannelFirstd(keys=["image", "label1", "label2"]), 
+    CLAHEd(keys=["image"], clip_limit=2.0, tile_grid_size=(8,8), color_range=255), 
+    CombineLabelsMono(), 
+    ScaleIntensityRanged(
+        keys=["image"],
+        a_min=0, a_max=255,
+        b_min=0.0, b_max=1.0,
+        clip=True,
+    ),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1), 
+    SqueezeDimd(keys=["image","label"], dim=-1),
+    CropForegroundd(keys=["image", "label"], source_key="image", allow_missing_keys=True)
+     ])
+train_ds = Dataset(data=train_files, transform=train_transforms)
+train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
+
+val_ds = Dataset(data=val_files, transform=val_transforms)
+val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
+model = DynUNet(
+    spatial_dims=2,
+    in_channels=1,
+    out_channels=3,  # Fondo (0), Mama (1), TFG (2)
+    kernel_size = [[3, 3]] * 5,
+    strides = [[1, 1], [2, 2], [2, 2], [2, 2], [2, 2]],    
+    upsample_kernel_size=[[2, 2]] * 4,
+    norm_name="batch",
+    act_name="softmax",
+    deep_supervision=False,
+    filters=(16, 32, 64, 128, 256, 512)
+).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr)
+weights = torch.tensor([1.0, 1.0, 2.0], dtype=torch.float32).to(device) 
+loss_function = DiceCELoss(
+    include_background=True,
+    to_onehot_y=True,
+    softmax=True,      # aplica softmax dentro
+    lambda_dice=1.0,
+    lambda_ce=1.0,
+    weight=weights)
+  #  Carga de pesos preentrenados 
+print("Iniciando carga de pesos preentrenados...")
+try:
+    checkpoint = torch.load(model_filename, map_location=device)
+    model_state_dict = model.state_dict()
+    new_state_dict = {}
+    keys_to_exclude = ['conv_final.weight', 'conv_final.bias']
+    for k, v in checkpoint.items():
+        if k in model_state_dict and v.shape == model_state_dict[k].shape and k not in keys_to_exclude:
+            new_state_dict[k] = v
+        elif k not in keys_to_exclude:
+            print(f"OMITIDO (Mismatch/Excluido): {k}") 
+    model.load_state_dict(new_state_dict, strict=False)
+    print("Carga de pesos y Filtrado de capas incompatibles completada.")
+except FileNotFoundError:
+    print(f" Archivo de modelo {model_filename} no encontrado. Iniciando entrenamiento desde cero.")
+except Exception as e:
+    print(f" Error al cargar el modelo (continuando sin pre-entrenamiento): {e}")
+encoder_blocks_to_freeze = 3 
+frozen_count = 0
+for name, param in model.named_parameters():
+        if frozen_count < encoder_blocks_to_freeze:
+        param.requires_grad = False
+        frozen_count += 1
+    else:
+        break
+optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr)
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print("-" * 10)
+print(f"Total de parámetros del modelo: {total_params}")
+print(f"Parámetros entrenables: {trainable_params}")
+print(f"Porcentaje de parámetros entrenables: {100 * trainable_params / total_params:.2f}%")
+print("-" * 10)
+  # ---------------------------------------------------------------------
+  # --- BUCLE DE ENTRENAMIENTO Y VALIDACIÓN 
+  # ---------------------------------------------------------------------
+loss_function_val = DiceCELoss(to_onehot_y=True, softmax=True, include_background=False) 
+dice_metric_avg = DiceMetric(include_background=False, reduction="mean")
+dice_metric_per_class = DiceMetric(include_background=False, reduction="none")
+post_pred = Compose([AsDiscrete(argmax=True, to_onehot=3)])
+post_label = Compose([AsDiscrete(to_onehot=3)])
+best_metric = -1
+best_metric_epoch = -1
+epoch_loss_values = []
+metric_values = []
+val_dice_avg_values = []
+val_dice_mama_values = []
+val_dice_tfg_values = []
+val_epoch_loss_values = []
+scaler = GradScaler()
+gc.collect()
+torch.cuda.empty_cache()
+print("Iniciando reentrenamiento...")
+for epoch in range(max_epochs):
+    print("-" * 10)
+    print(f"epoch {epoch + 1}/{max_epochs}")
+    model.train()
+    epoch_loss = 0
+    step = 0
+    for batch_data in train_loader:
+        step += 1
+        inputs, labels = batch_data["image"].to(device), batch_data["label"].to(device)
+        optimizer.zero_grad()    
+        outputs = model(inputs)
+        loss = loss_function(outputs, labels) # Usando la pérdida ponderada
+        loss.backward()
+        optimizer.step()        
+        epoch_loss += loss.item()
+    epoch_loss /= step
+    epoch_loss_values.append(epoch_loss)
+    print(f"epoch {epoch + 1} average loss: {epoch_loss:.4f}")
+    torch.cuda.empty_cache()
+    if (epoch + 1) % val_interval == 0:
+        model.eval() 
+        dice_metric_avg.reset()
+        dice_metric_per_class.reset()        
+        val_epoch_loss = 0
+        val_step = 0        
+        with torch.no_grad():
+            for val_data in val_loader:
+                val_step += 1
+                val_inputs = val_data["image"].to(device) 
+                val_labels = val_data["label"].to(device)
+                roi_size = size_cube
+                sw_batch_size = 1                
+                val_outputs = sliding_window_inference(val_inputs, roi_size, sw_batch_size, model)
+                
+                # Cálculo de la pérdida de validación
+                val_loss = loss_function_val(val_outputs, val_labels) 
+                val_epoch_loss += val_loss.item()                
+                val_outputs_processed = [post_pred(i) for i in decollate_batch(val_outputs)]
+                val_labels_processed = [post_label(i) for i in decollate_batch(val_labels)]
+                dice_metric_avg(y_pred=val_outputs_processed, y=val_labels_processed)
+                dice_metric_per_class(y_pred=val_outputs_processed, y=val_labels_processed)
+            val_epoch_loss /= val_step            
+            metric = dice_metric_avg.aggregate().item()
+            metric_per_class = dice_metric_per_class.aggregate()            
+            metric_mama = metric_per_class[0].mean().item() if len(metric_per_class) > 0 else 0
+            metric_tfg = metric_per_class[1].mean().item() if len(metric_per_class) > 1 else 0
+            dice_metric_avg.reset()
+            dice_metric_per_class.reset()
+            metric_values.append(metric)
+            val_dice_avg_values.append(metric) 
+            val_dice_mama_values.append(metric_mama)
+            val_dice_tfg_values.append(metric_tfg)
+            if metric > best_metric:
+                best_metric = metric
+                best_metric_epoch = epoch + 1
+                best_model_path_new = os.path.join(save_dir, f"best_model_epoch_{epoch + 1}_dice_{metric:.4f}.pth")
+                torch.save(model.state_dict(), best_model_path_new)
+            print(f" Nuevo mejor modelo guardado: {best_model_path_new}")
+        model_path_new = os.path.join(checkpoints_dir, f"model_epoch_{epoch + 1}.pth")
+        torch.save(model.state_dict(), model_path_new)
+        print(f"Pérdida de Validación (Sin Fondo): {val_epoch_loss:.4f}")
+        print(f"Métrica de Validación Promedio (Sin Fondo): {metric:.4f}")
+        print(f"Dice Mama (Clase 1): {metric_mama:.4f}")
+        print(f"Dice TFG (Clase 2): {metric_tfg:.4f}")
+        model.train() 
+        torch.cuda.empty_cache()         
+print(f"\n Mejor Dice: {best_metric:.4f} en la época {best_metric_epoch}")    
+  # Guardado de métricas
+df_train = pd.DataFrame({"epoch": list(range(1, len(epoch_loss_values) + 1)), "train_loss": epoch_loss_values})
+df_train.to_csv(os.path.join(save_dir, "train_metrics.csv"), index=False)
+val_epochs = list(range(val_interval, (len(val_dice_avg_values) * val_interval) + 1, val_interval))
+df_val = pd.DataFrame({
+    "epoch": val_epochs,
+    "val_dice_avg": val_dice_avg_values,
+    "val_dice_mama": val_dice_mama_values,
+    "val_dice_tfg": val_dice_tfg_values,
+    "val_epoch_loss": val_epoch_loss_values
+})
+df_val.to_csv(os.path.join(save_dir, "val_metrics.csv"), index=False)
+  # Guardar modelo final
+torch.save(model.state_dict(), os.path.join(save_dir, "final_model.pth"))
+print("Modelo final guardado")

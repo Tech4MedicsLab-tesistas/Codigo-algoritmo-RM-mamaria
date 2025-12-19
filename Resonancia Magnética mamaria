@@ -1,0 +1,689 @@
+# CÓDIGO DE PROGRAMACIÓN PARA PROCESO DE FINE-TUNING EN RESONANCIA MAGNÉTICA
+# PROCESO DE TRAINING
+split_json = "RM_dataset.json"
+    # PARÁMETROS DEL MODELO Y ENTRENAMIENTO
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+train_size = (96, 96, 64)
+roi_size = (128, 128, 96)
+max_epochs = 600
+val_interval = 10
+size_cube = train_size
+    # Función para encontrar archivos
+con extensión .nii o .nii.gz
+def find_valid_file(nombre_archivo, base_path):
+    posibles_rutas = []
+    if nombre_archivo.endswith(".nii") or nombre_archivo.endswith(".nii.gz"):
+        posibles_rutas.append(nombre_archivo)
+    else:
+        posibles_rutas.extend([nombre_archivo + ".nii", nombre_archivo + ".nii.gz"])
+
+    for ruta_relativa in posibles_rutas:
+        ruta_abs = os.path.join(base_path, ruta_relativa)
+        if os.path.exists(ruta_abs):
+            return ruta_abs
+    return None
+raw_files = load_decathlon_datalist(json_path, True, "training")
+train_files_pre = []
+for item in raw_files:
+    try:
+        nuevo_item = {} 
+        for key in ["image", "label1", "label2", "label3", "label4"]:
+            nombre = item[key].strip()
+            ruta_valida = find_valid_file(nombre, data_dir)
+            if ruta_valida is None:
+                raise FileNotFoundError(f"No se encontró archivo válido para: {nombre}")
+            nuevo_item[key] = ruta_valida
+        train_files_pre.append(nuevo_item)
+            except (FileNotFoundError, KeyError) as e:
+        print(f"❌ Error al procesar la entrada: {item} -> {e}. Esta entrada será omitida.")
+        
+if len(train_files_pre) == 0:
+    raise ValueError("No se encontraron archivos válidos para entrenamiento. Revisa tus rutas en el JSON.")
+train_files, val_files = train_test_split(train_files_pre, test_size=0.2, random_state=42)
+print(f" Muestras de entrenamiento: {len(train_files)}")
+print(f" Muestras de validación: {len(val_files)}")
+    # Definición de las transformaciones
+train_transforms = Compose(
+    [
+        LoadImaged(keys=["image", "label1", "label2", "label3", "label4"]), 
+        EnsureChannelFirstd(keys=["image", "label1", "label2", "label3", "label4"]),
+        # Preprocesamiento: Orientación y Espaciado
+        Orientationd(keys=["image", "label1", "label2", "label3", "label4"], axcodes="RAS"),
+        Spacingd(
+            keys=["image", "label1", "label2", "label3", "label4"],
+            pixdim=(1.0, 1.0, 1.0), # Espaciado isotrópico de 1mm. 
+            mode=("bilinear", "nearest", "nearest", "nearest", "nearest")),
+        ScaleIntensityRangePercentilesd(
+            keys=["image"],         
+            lower=0.1,              
+            upper=99.9,             
+            b_min=0.0,              
+            b_max=1.0,              
+            clip=True,              
+            relative=False          
+        ),
+        CombineLabelsd(),
+        CropForegroundd(keys=["image", "label"], source_key="label", margin=10),
+        SpatialPadD(
+            keys=["image", "label"],
+            spatial_size=roi_size, 
+            method="end", 
+            mode="constant"),
+        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+        RandRotate90d(keys=["image", "label"], prob=0.5, spatial_axes=(0, 1)),
+        RandAffined(
+            keys=['image', 'label'],
+            mode=('bilinear', 'nearest'),
+            prob=0.5,
+            rotate_range=(np.pi/18, np.pi/18, np.pi/12),
+            scale_range=(0.9, 1.1),
+            padding_mode="zeros" ),
+        RandGaussianNoised(keys=["image"], prob=0.25, std=0.05),
+            RandCropByPosNegLabeld(
+            keys=["image", "label"],
+            label_key="label",
+            spatial_size=size_cube,
+            pos=1.0, 
+            neg=0.2, 
+            num_samples=8,
+            image_key="image",
+            image_threshold=0, ),
+            ToTensord(keys=["image", "label"]),])
+val_transforms = Compose(
+    [LoadImaged(keys=["image", "label1", "label2", "label3", "label4"]),
+        EnsureChannelFirstd(keys=["image", "label1", "label2", "label3", "label4"]),
+        Orientationd(keys=["image", "label1", "label2", "label3", "label4"], axcodes="RAS"),
+        Spacingd(
+            keys=["image", "label1", "label2", "label3", "label4"],
+            pixdim=(1.0, 1.0, 1.0), # Mismo pixdim que en entrenamiento
+            mode=("bilinear", "nearest", "nearest", "nearest", "nearest")),
+        ScaleIntensityRangePercentilesd(
+            keys=["image"],         
+            lower=0.1,              
+            upper=99.9,             
+            b_min=0.0,              
+            b_max=1.0,              
+            clip=True,              
+            relative=False          
+        ),
+          CombineLabelsd(), 
+        ToTensord(keys=["image", "label"]),])
+train_ds = Dataset(data=train_files, transform=train_transforms)
+train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
+val_ds = Dataset(data=val_files, transform=val_transforms)
+val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
+
+    # --- MODELO, PÉRDIDA, OPTIMIZADOR Y MÉTRICAS ---
+model = UNet(
+    spatial_dims=3,
+    in_channels=1,
+    out_channels=3,
+    channels=(16, 32, 64, 128, 256),
+    strides=(2, 2, 2, 2),
+    num_res_units=2,
+    norm=Norm.BATCH,
+).to(device)
+model.load_state_dict(torch.load(model_filename, map_location=device))
+encoder_blocks_to_freeze = 4 
+frozen_count = 0
+for name, param in model.named_parameters():
+        if frozen_count < encoder_blocks_to_freeze:
+        param.requires_grad = False
+        frozen_count += 1
+    else:
+        break
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print("-" * 10)
+print(f"Total de parámetros del modelo: {total_params}")
+print(f"Parámetros entrenables: {trainable_params}")
+print(f"Porcentaje de parámetros entrenables: {100 * trainable_params / total_params:.2f}%")
+print("-" * 10)
+    #  Función de pérdida y optimizador
+loss_function = DiceLoss(to_onehot_y=True, softmax=True)
+trainable_parameters = filter(lambda p: p.requires_grad, model.parameters())
+optimizer = torch.optim.Adam(trainable_parameters, lr=1e-4)
+    # Métricas
+dice_metric_avg = DiceMetric(include_background=False, reduction="mean")
+dice_metric_per_class = DiceMetric(include_background=False, reduction="none")
+    # Postprocesamiento
+post_pred = Compose([AsDiscrete(argmax=True, to_onehot=3)])
+post_label = Compose([AsDiscrete(to_onehot=3)])
+    #  Variables de seguimiento
+best_metric = -1
+best_metric_epoch = -1
+epoch_loss_values = []
+metric_values = []
+val_loss_values = []
+val_dice_avg_values = []
+val_dice_mama_values = []
+val_dice_tfg_values = []
+scaler = GradScaler()
+    # --- BUCLE DE ENTRENAMIENTO Y VALIDACIÓN ---
+print(" Iniciando reentrenamiento...")
+for epoch in range(max_epochs):
+    print("-" * 10)
+    print(f"Epoch {epoch + 1}/{max_epochs}")
+    model.train()
+    epoch_loss = 0
+    step = 0
+    for batch_data in train_loader:
+        step += 1
+        inputs = batch_data["image"].to(device)
+        labels = batch_data["label"].to(device)
+        optimizer.zero_grad()
+                with autocast():
+            outputs = model(inputs)
+            loss = loss_function(outputs, labels)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        epoch_loss += loss.item()
+        print(f"{step}/{len(train_loader)}, train_loss: {loss.item():.4f}")    
+    epoch_loss /= step
+    epoch_loss_values.append(epoch_loss)
+    print(f"Epoch {epoch + 1} average loss: {epoch_loss:.4f}")
+    # Bucle de validación
+    if (epoch + 1) % val_interval == 0:
+        model.eval()
+        val_epoch_loss = 0
+        val_steps = 0
+        dice_metric_avg.reset()
+        dice_metric_per_class.reset()
+
+        with torch.no_grad():
+            for val_data in val_loader:
+                val_steps += 1
+                val_inputs = val_data["image"].to(device)
+                val_labels = val_data["label"].to(device)
+
+                val_outputs_raw = sliding_window_inference(val_inputs, roi_size, 1, model, sw_device=device)
+                val_loss = loss_function(val_outputs_raw, val_labels)
+                val_epoch_loss += val_loss.item()
+
+                val_outputs = [post_pred(i) for i in decollate_batch(val_outputs_raw)]
+                val_labels = [post_label(i) for i in decollate_batch(val_labels)]
+
+                dice_metric_avg(y_pred=val_outputs, y=val_labels)
+                dice_metric_per_class(y_pred=val_outputs, y=val_labels)
+
+        val_epoch_loss /= val_steps
+        val_loss_values.append(val_epoch_loss)
+
+        val_dice_avg = dice_metric_avg.aggregate().item()
+        per_class_result = dice_metric_per_class.aggregate()
+        per_class_means = per_class_result.mean(dim=0)
+        val_dice_mama = per_class_means[0].item()
+        val_dice_tfg = per_class_means[1].item()
+
+        val_dice_avg_values.append(val_dice_avg)
+        val_dice_mama_values.append(val_dice_mama)
+        val_dice_tfg_values.append(val_dice_tfg)
+
+        print(
+                f"\nValidation - Loss: {val_epoch_loss:.4f}"
+                f" | Dice Promedio: {val_dice_avg:.4f}"
+                f" | Dice Mama: {val_dice_mama:.4f}"
+                f" | Dice TFG: {val_dice_tfg:.4f}\n"val_loss_values )
+        metric_values.append(val_dice_avg)
+        if val_dice_avg > best_metric:
+            best_metric = val_dice_avg
+            best_metric_epoch = epoch + 1
+            best_model_path_new = os.path.join(save_dir, f"best_model_epoch_{epoch + 1}_dice_{val_dice_avg:.4f}.pth")
+            torch.save(model.state_dict(), best_model_path_new)
+            print(f"Nuevo mejor modelo guardado: {best_model_path_new}")
+        model_path_new = os.path.join(checkpoints_dir, f"model_epoch_{epoch + 1}.pth")
+        torch.save(model.state_dict(), model_path_new)
+print(f"\nMejor Dice: {best_metric:.4f} en la época {best_metric_epoch}")
+    # Guardado de métricas
+df_train = pd.DataFrame({"epoch": list(range(1, len(epoch_loss_values) + 1)), "train_loss": epoch_loss_values})
+df_train.to_csv(os.path.join(save_dir, "train_metrics.csv"), index=False)
+val_epochs = list(range(val_interval, (len(val_loss_values) * val_interval) + 1, val_interval))
+df_val = pd.DataFrame({
+    "epoch": val_epochs,
+    "val_loss": val_loss_values,
+    "val_dice_avg": val_dice_avg_values,
+    "val_dice_mama": val_dice_mama_values,
+    "val_dice_tfg": val_dice_tfg_values,})
+df_val.to_csv(os.path.join(save_dir, "val_metrics.csv"), index=False)
+    # Guardar modelo final
+torch.save(model.state_dict(), os.path.join(save_dir, "final_model.pth"))data_dir
+print("Modelo final guardado")
+    plt.show()
+
+# CÓDIGO DE TESTING DEL MODELO
+    # ----------------------------------------------------------------------
+    # DEFINICIÓN DEL MODELO
+    # ---------------------------------------------------------------------
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(f"Usando device: {device}")
+
+model = UNet(
+    spatial_dims=3,
+    in_channels=1,
+    out_channels=3,  
+    channels=(16, 32, 64, 128, 256),
+    strides=(2, 2, 2, 2),
+    num_res_units=2,
+    norm=Norm.BATCH,
+).to(device)
+
+if os.path.exists(model_filename):
+    model.load_state_dict(torch.load(model_filename, map_location=device))
+else:
+    print(f"¡ADVERTENCIA! No se encontró el archivo del modelo en {model_filename}. El modelo no se cargará.")
+model.eval()
+size_cube = (96, 96, 64) 
+roi_size = (128, 128, 96)
+model.to(device) 
+MAMA_CLASS_ID = 1
+TFG_CLASS_ID = 2
+    # ----------------------------------------------------------------------
+    # TRANSFORMACIONES
+    # ----------------------------------------------------------------------
+KEYS_ALL = ["image", "label1", "label2", "label3", "label4"] 
+transforms = Compose([
+    LoadImaged(keys= KEYS_ALL),
+    EnsureChannelFirstd(keys=KEYS_ALL),
+    Orientationd(keys=KEYS_ALL, axcodes="RAS"),
+    CombineLabelsd(),
+    ScaleIntensityRangePercentilesd(
+                keys=["image"],          
+                lower=0.1,           
+                upper=99.9,          
+                b_min=0.0,           
+                b_max=1.0,           
+                clip=True,           
+                relative=False ),])
+post_pred = Compose([
+    AsDiscrete(argmax=True, to_onehot=3)])
+check_ds = Dataset(data=test_files, transform=transforms)
+check_loader = DataLoader(check_ds, batch_size=1)
+    # ----------------------------------------------------------------------
+    # FUNCIONES DE VOLUMETRÍA
+    # ----------------------------------------------------------------------
+def calcular_volumen(imagen, tamano_voxel):
+    """
+    Calcula el volumen de un tejido segmentado (máscara binaria).
+    """
+    num_voxels = np.sum(imagen > 0) 
+    volumen_tejido = num_voxels * tamano_voxel
+    return volumen_tejido
+
+def calcular_porcentaje_densidad(mask_tfg, mask_mama, voxel_vol_cm3):
+    """
+    Calcula DM sin forzar solapamiento perfecto entre TFG y mama.
+    Si el TFG está fuera, se asume igualmente como tejido válido dentro de la mama.
+    """
+    vol_mama = np.sum(mask_mama > 0) * voxel_vol_cm3
+    vol_tfg = np.sum(mask_tfg > 0) * voxel_vol_cm3    
+    if vol_tfg > vol_mama:
+        vol_tfg = np.sum((mask_tfg > 0) & (mask_mama > 0)) * voxel_vol_cm3    
+    if vol_mama == 0:
+        return 0.0, vol_tfg, vol_mama
+    dm = (vol_tfg / vol_mama) * 100
+    return dm, vol_tfg, vol_mama
+def dice_coef(pred, gt):
+    pred_bin = (pred > 0).astype(np.uint8)
+    gt_bin = (gt > 0).astype(np.uint8)
+    inter = (pred_bin & gt_bin).sum()
+    denom = pred_bin.sum() + gt_bin.sum()
+    if denom == 0:
+        return 1.0
+    return 2.0 * inter / denom
+def iou_score(pred, gt):
+    pred_bin = (pred > 0).astype(np.uint8)
+    gt_bin = (gt > 0).astype(np.uint8)
+    inter = (pred_bin & gt_bin).sum()
+    union = (pred_bin | gt_bin).sum()
+    if union == 0:
+        return 1.0
+    return inter / union
+def get_spacing_from_meta(meta_dict, affine):
+    """
+    Devuelve (dx, dy, dz) en mm de forma robusta.
+    meta_dict puede ser un dict o MetaTensor.meta.
+    """
+    if meta_dict is not None:
+        # buscar claves comunes
+        for k in ("pixdim", "spacing", "voxsize", "affine_spacing"):
+            if k in meta_dict:
+                val = meta_dict[k]
+                try:
+                    arr = np.asarray(val)
+                    # si tiene >=3 valores, tomar los últimos 3
+                    if arr.size >= 3:
+                        return float(arr[-3]), float(arr[-2]), float(arr[-1])
+                except Exception:
+                    pass
+    try:
+        A = np.array(affine)
+        sx = float(np.linalg.norm(A[:3, 0]))
+        sy = float(np.linalg.norm(A[:3, 1]))
+        sz = float(np.linalg.norm(A[:3, 2]))
+        return sx, sy, sz
+    except Exception:
+        return 1.0, 1.0, 1.0
+def hausdorff_distance(pred, gt, spacing=(1.0, 1.0, 1.0), percentile=95):
+    """
+    Calcula HD percentile (por defecto HD95) entre pred y gt.
+    Devuelve distancia en las mismas unidades que spacing (mm si spacing en mm).
+    """
+    pred = (pred > 0).astype(np.bool_)
+    gt = (gt > 0).astype(np.bool_)
+
+    # Casos especiales
+    if not pred.any() and not gt.any():
+        return 0.0
+    if not pred.any() or not gt.any():
+        return np.inf
+    pred_surface = np.logical_xor(pred, binary_erosion(pred))
+    gt_surface = np.logical_xor(gt, binary_erosion(gt))
+    dt_pred = distance_transform_edt(~pred_surface, sampling=spacing)
+    dt_gt = distance_transform_edt(~gt_surface, sampling=spacing)
+    dist_pred_to_gt = dt_gt[pred_surface]
+    dist_gt_to_pred = dt_pred[gt_surface]
+    all_distances = np.concatenate([dist_pred_to_gt, dist_gt_to_pred])
+    hd_percentile = np.percentile(all_distances, percentile)
+    return float(hd_percentile)
+def corregir_inversion_si_necesaria(gt_mask, pred_mask):
+    """
+    Prueba versiones invertidas de la máscara predicha y escoge la que tenga mejor Dice con la GT.
+    """
+    versiones = {
+        "original": pred_mask,
+        "flip_x": np.flip(pred_mask, axis=0),
+        "flip_y": np.flip(pred_mask, axis=1),
+        "flip_z": np.flip(pred_mask, axis=2),
+        "flip_xy": np.flip(np.flip(pred_mask, axis=0), axis=1),
+        "flip_xz": np.flip(np.flip(pred_mask, axis=0), axis=2),
+        "flip_yz": np.flip(np.flip(pred_mask, axis=1), axis=2),
+        "flip_xyz": np.flip(np.flip(np.flip(pred_mask, axis=0), axis=1), axis=2),}
+    mejor_dice = -1
+    mejor_version = pred_mask
+    mejor_nombre = "original"
+    for nombre, version in versiones.items():
+        dice = dice_coef(version, gt_mask)
+        if dice > mejor_dice:
+            mejor_dice = dice
+            mejor_version = version
+            mejor_nombre = nombre
+    print(f"[CORRECCIÓN] Mejor versión: {mejor_nombre} con Dice: {mejor_dice:.4f}")
+    return mejor_version
+
+from nibabel.processing import resample_from_to
+def alinear_mascaras(gt_img, pred_img):
+    """
+    Re-muestrea la máscara predicha al espacio físico de la máscara manual (GT).
+    Esto corrige desplazamientos o diferencias en affine o voxel size.
+    """
+    if not np.allclose(gt_img.affine, pred_img.affine) or gt_img.shape != pred_img.shape:
+        pred_resampled = resample_from_to(pred_img, gt_img, order=0)  # nearest neighbor
+        return gt_img, pred_resampled
+    return gt_img, pred_img
+    # ----------------------------------------------------------------------
+    # BUCLE DE INFERENCIA, CÁLCULO Y ALMACENAMIENTO
+    # ----------------------------------------------------------------------
+results_list = []
+viz_data_list = [] 
+with torch.no_grad():
+    for i, test_data in enumerate(check_loader):
+        image_meta_tensor = test_data["image"]
+        test_inputs = image_meta_tensor.to(device)
+        meta_dict = None
+        affine = None        
+        try:
+            if "image_meta_dict" in test_data:
+                meta_dict = test_data["image_meta_dict"][0]
+            elif hasattr(image_meta_tensor, "meta"):
+                meta_dict = image_meta_tensor.meta
+            else:
+                meta_dict = {}
+            if meta_dict is None:
+                meta_dict = {}
+            if "affine" in meta_dict:
+                a = meta_dict["affine"]
+                if isinstance(a, (list, tuple)):
+                    a = a[0]
+                affine = np.array(a)
+                affine = np.squeeze(affine)
+                if affine.shape != (4, 4):
+                    print(f"[Advertencia] affine con forma {affine.shape} en {i=}, se usará identidad.")
+                    affine = np.eye(4)
+            else:
+                affine = None
+        except Exception as e:
+            print(f"[Error metadatos] No se pudo extraer affine ({e}), usando identidad.")
+            meta_dict = {}
+            affine = None
+        if affine is None:
+            affine = np.eye(4)
+        dx, dy, dz = 1.0, 1.0, 1.0  
+        tamano_voxel_mm3 = dx * dy * dz
+        tamano_voxel_cm3 = tamano_voxel_mm3 / 1000.0 # = 0.001 cm3
+        try:
+            image_path = None
+            if isinstance(meta_dict, dict) and "filename_or_obj" in meta_dict:
+                image_path = meta_dict["filename_or_obj"]
+                if isinstance(image_path, (list, tuple)):
+                    image_path = image_path[0]
+            elif hasattr(image_meta_tensor, "meta") and "filename_or_obj" in image_meta_tensor.meta:
+                image_path = image_meta_tensor.meta["filename_or_obj"]
+                if isinstance(image_path, (list, tuple)):
+                    image_path = image_meta_tensor.meta["filename_or_obj"][0]
+            image_name = os.path.basename(str(image_path)).split(".")[0] if image_path is not None else f"study_{i}"
+        except Exception:
+            image_name = f"study_{i}"
+        study_id = image_name        
+        # 1. Carga y Preparación del GROUND TRUTH (GT)
+        gt_mask_data = test_data["label"].cpu().numpy()[0, 0].astype(np.uint8)
+        gt_mama_total = (gt_mask_data == MAMA_CLASS_ID).astype(np.uint8)
+        gt_tfg_total = (gt_mask_data == TFG_CLASS_ID).astype(np.uint8)            
+        def resize_to_pred(mask, target_shape):
+            """
+            Redimensiona una máscara (GT o predicción) para que tenga el mismo tamaño que la predicción del modelo.
+            Usa interpolación nearest neighbor (order=0) para mantener las etiquetas.
+            """
+            if mask.shape != target_shape:
+                mask_resized = resize(
+                    mask,
+                    target_shape,
+                    order=0,            # nearest-neighbor para máscaras binarias
+                    preserve_range=True,
+                    anti_aliasing=False).astype(np.uint8)
+                return mask_resized
+            else:
+                return mask
+        test_outputs_raw = sliding_window_inference(test_inputs, size_cube, 1, model, sw_device=device)
+        test_outputs_post = [post_pred(i) for i in decollate_batch(test_outputs_raw)][0]
+        model_label_np = np.argmax(test_outputs_post.cpu().numpy(), axis=0)  # [D,H,W]
+        print(f"[DEBUG] test_outputs_raw shape: {test_outputs_raw.shape}")
+        print(f"[DEBUG] test_outputs_post shape: {test_outputs_post.shape}")
+        print(f"[DEBUG] Unique values in argmax label map: {np.unique(model_label_np)}")        
+        from nibabel.processing import resample_from_to
+        import nibabel as nib        
+        try:
+            if "label_meta_dict" in test_data and "affine" in test_data["label_meta_dict"][0]:
+                affine_gt = np.array(test_data["label_meta_dict"][0]["affine"])
+            else:
+                affine_gt = affine     
+            gt_ref = (gt_mama_total + gt_tfg_total).astype(np.uint8)        
+            pred_nib = nib.Nifti1Image(model_label_np.astype(np.uint8), affine)
+            gt_nib   = nib.Nifti1Image(gt_ref, affine_gt)
+            pred_nib = nib.as_closest_canonical(pred_nib)
+            gt_nib   = nib.as_closest_canonical(gt_nib)
+            if (pred_nib.shape != gt_nib.shape) or (not np.allclose(pred_nib.affine, gt_nib.affine)):
+                pred_resampled_nib = resample_from_to(pred_nib, gt_nib, order=0)
+                model_label_np = pred_resampled_nib.get_fdata().astype(np.uint8)
+                affine = gt_nib.affine.copy()
+                print(f"[ALIGN] Se remuestreó la predicción de {pred_nib.shape} a {gt_nib.shape}")
+            else:
+                model_label_np = pred_nib.get_fdata().astype(np.uint8)
+                print("[ALIGN] Shapes y affines coinciden; no se requirió resample.")
+        
+        except Exception as e:
+            print(f"[ALIGN WARNING] No se pudo alinear/resamplear: {e}")
+            model_label_np = np.asarray(model_label_np).astype(np.uint8)
+            
+        total_breast_mask = (model_label_np == MAMA_CLASS_ID).astype(np.uint8)
+        total_tfg_mask    = (model_label_np == TFG_CLASS_ID).astype(np.uint8)
+        gt_img_nib_mama = nib.Nifti1Image(gt_mama_total, affine)
+        pred_img_nib_mama = nib.Nifti1Image(total_breast_mask, affine)
+        gt_img_nib_mama, pred_img_nib_mama = alinear_mascaras(gt_img_nib_mama, pred_img_nib_mama)
+        gt_mama_total = gt_img_nib_mama.get_fdata().astype(np.uint8)
+        total_breast_mask = pred_img_nib_mama.get_fdata().astype(np.uint8)        
+        gt_img_nib_tfg = nib.Nifti1Image(gt_tfg_total, affine)
+        pred_img_nib_tfg = nib.Nifti1Image(total_tfg_mask, affine)
+        gt_img_nib_tfg, pred_img_nib_tfg = alinear_mascaras(gt_img_nib_tfg, pred_img_nib_tfg)
+        gt_tfg_total = gt_img_nib_tfg.get_fdata().astype(np.uint8)
+        total_tfg_mask = pred_img_nib_tfg.get_fdata().astype(np.uint8)
+        total_breast_mask = corregir_inversion_si_necesaria(gt_mama_total, total_breast_mask)
+        total_tfg_mask = corregir_inversion_si_necesaria(gt_tfg_total, total_tfg_mask)
+        image_np_to_save = image_meta_tensor[0, 0].cpu().numpy().astype(np.float32) 
+        viz_data_list.append({
+            "study_id": image_name,
+            "image": image_np_to_save,       # Imagen de entrada 3D (D, H, W)
+            "mask_mama": total_breast_mask,  # Máscara de mama 3D (D, H, W)
+            "mask_tfg": total_tfg_mask,      # Máscara de TFG 3D (D, H, W)
+            "spacing": (dx, dy, dz) })
+        
+        print(f"Predicting and calculating DM for... {image_name}")
+        if np.sum(total_breast_mask) == 0:
+            print(f"Advertencia: No se detectó volumen de mama para el estudio {image_name}.")
+            results_list.append({
+                "ID": image_name,
+                "DM_Total_IA": 0.0,
+                "DM_Der_IA": 0.0, "Vol_TFG_Der_IA": 0.0, "Vol_Mama_Der_IA": 0.0,
+                "DM_Der_Manual": 0.0, "Vol_TFG_Der_Manual": 0.0, "Vol_Mama_Der_Manual": 0.0,
+                "DM_Izq_IA": 0.0, "Vol_TFG_Izq_IA": 0.0, "Vol_Mama_Izq_IA": 0.0,
+                "DM_Izq_Manual": 0.0, "Vol_TFG_Izq_Manual": 0.0, "Vol_Mama_Izq_Manual": 0.0,
+                "Dice_Mama": 0.0, "Dice_TFG": 0.0, "IoU_Mama": 0.0, "IoU_TFG": 0.0,
+                "HD95_Mama_mm": np.inf, "HD95_TFG_mm": np.inf
+            })
+            nib.save(nib.Nifti1Image(total_breast_mask.astype(np.uint8), affine), os.path.join(output_mask_dir, f"{image_name}_mask_mama_der.nii.gz"))
+            nib.save(nib.Nifti1Image(total_breast_mask.astype(np.uint8), affine), os.path.join(output_mask_dir, f"{image_name}_mask_mama_izq.nii.gz"))
+            nib.save(nib.Nifti1Image(total_tfg_mask.astype(np.uint8), affine), os.path.join(output_mask_dir, f"{image_name}_mask_tfg_der.nii.gz"))
+            nib.save(nib.Nifti1Image(total_tfg_mask.astype(np.uint8), affine), os.path.join(output_mask_dir, f"{image_name}_mask_tfg_izq.nii.gz"))
+            continue
+
+       # --- Separación derecha/izquierda basada en el centro de masa ---
+        com_vox = center_of_mass(total_breast_mask) 
+        if np.isnan(com_vox[2]):
+            print("[WARN] Center of mass is NaN. Using mid-plane as fallback.")
+            com_vox = (total_breast_mask.shape[0]//2,
+                       total_breast_mask.shape[1]//2,
+                       total_breast_mask.shape[2]//2)
+        aff = affine 
+        axis_sagital = np.argmax(np.abs(aff[:3, 0]))
+
+        if study_id == "12571_RMimaging":
+            print("[CORRECCIÓN FLIP LR] Aplicando flip al EJE SAGITAL SÓLO AL GROUND TRUTH.")   
+            # 1. Definir el slicer de inversión
+            slicer = [slice(None)] * gt_mask_data.ndim
+            slicer[axis_sagital] = slice(None, None, -1)            
+            # 2. Aplicar el flip a la máscara GT
+            gt_mask_data = gt_mask_data[tuple(slicer)].copy()       
+        axis_sagital = np.argmax(np.abs(aff[:3, 0]))    
+        # Calcular dirección del eje sagital (signo del vector)
+        direction = np.sign(aff[axis_sagital, 0])             
+        # Calcular plano de corte
+        mid_voxel = int(com_vox[axis_sagital])
+        print(f"[INFO] Eje sagital (LR): {axis_sagital}, Dirección: {direction}, Plano medio: {mid_voxel}")        
+        # Inicializar máscaras
+        patient_right_mask = np.zeros_like(total_breast_mask, dtype=bool)
+        patient_left_mask  = np.zeros_like(total_breast_mask, dtype=bool)
+        
+        if direction > 0:  # eje normal
+            slicer_right = slice(None, mid_voxel)
+            slicer_left = slice(mid_voxel, None)
+        else:  # eje invertido
+            slicer_right = slice(mid_voxel, None)
+            slicer_left = slice(None, mid_voxel)        
+        if axis_sagital == 0:
+            patient_right_mask[slicer_right, :, :] = True
+            patient_left_mask[slicer_left, :, :] = True
+        elif axis_sagital == 1:
+            patient_right_mask[:, slicer_right, :] = True
+            patient_left_mask[:, slicer_left, :] = True
+        else:
+            patient_right_mask[:, :, slicer_right] = True
+            patient_left_mask[:, :, slicer_left] = True
+        output_mama_der = np.logical_and(total_breast_mask, patient_right_mask)
+        output_mama_izq = np.logical_and(total_breast_mask, patient_left_mask)
+        output_tfg_der = np.logical_and(total_tfg_mask, patient_right_mask)
+        output_tfg_izq = np.logical_and(total_tfg_mask, patient_left_mask)        
+        print("[CHECK] Voxels TFG der:", np.sum(output_tfg_der))
+        print("[CHECK] Voxels TFG izq:", np.sum(output_tfg_izq))
+        print("SUMA MÁSCARAS:")
+        print("output_mama_der:", np.sum(output_mama_der))
+        print("output_tfg_der:", np.sum(output_tfg_der))
+        print("output_mama_izq:", np.sum(output_mama_izq))
+        print("output_tfg_izq:", np.sum(output_tfg_izq))
+        inter_der = np.logical_and(output_tfg_der > 0, output_mama_der > 0)
+        inter_izq = np.logical_and(output_tfg_izq > 0, output_mama_izq > 0)
+        
+        print(f"SUMA INTERSECCIÓN:")
+        print(f"inter_der: {np.sum(inter_der)}")
+        print(f"inter_izq: {np.sum(inter_izq)}")
+        
+        gt_mama_der = (gt_mama_total & patient_right_mask).astype(np.uint8)
+        gt_tfg_der  = (gt_tfg_total & patient_right_mask).astype(np.uint8)
+        gt_mama_izq = (gt_mama_total & patient_left_mask).astype(np.uint8)
+        gt_tfg_izq  = (gt_tfg_total & patient_left_mask).astype(np.uint8)
+
+        # --- Calcular DM y volúmenes ---
+  	dm_der_pred, vol_tfg_der_pred, vol_mama_der_pred = calcular_porcentaje_densidad(output_tfg_der, output_mama_der, tamano_voxel_cm3)
+    	dm_izq_pred, vol_tfg_izq_pred, vol_mama_izq_pred = calcular_porcentaje_densidad(output_tfg_izq, output_mama_izq, tamano_voxel_cm3)
+        dm_der_gt, vol_tfg_der_gt, vol_mama_der_gt = calcular_porcentaje_densidad(gt_tfg_der, gt_mama_der, tamano_voxel_cm3)
+        dm_izq_gt, vol_tfg_izq_gt, vol_mama_izq_gt = calcular_porcentaje_densidad(gt_tfg_izq, gt_mama_izq, tamano_voxel_cm3)
+
+        # --- Cálculo de métricas ---
+        dice_mama = dice_coef(total_breast_mask, gt_mama_total)
+        dice_tfg  = dice_coef(total_tfg_mask, gt_tfg_total)
+        iou_mama  = iou_score(total_breast_mask, gt_mama_total)
+        iou_tfg   = iou_score(total_tfg_mask, gt_tfg_total)
+        hd95_mama = hausdorff_distance(total_breast_mask, gt_mama_total, spacing=(dx, dy, dz))
+        hd95_tfg  = hausdorff_distance(total_tfg_mask, gt_tfg_total, spacing=(dx, dy, dz))
+
+        print(f"DM Derecha: IA={dm_der_pred:.2f}% | Manual={dm_der_gt:.2f}%")
+        print(f"DM Izquierda: IA={dm_izq_pred:.2f}% | Manual={dm_izq_gt:.2f}%")
+        print(f"Dice Mama={dice_mama:.3f} | Dice TFG={dice_tfg:.3f} | HD95 Mama={hd95_mama:.2f} mm | HD95 TFG={hd95_tfg:.2f} mm")
+
+        # --- DM total IA ---
+        dm_total_ia = ((vol_tfg_der_pred + vol_tfg_izq_pred) / (vol_mama_der_pred + vol_mama_izq_pred) * 100) if (vol_mama_der_pred + vol_mama_izq_pred) > 0 else 0.0
+
+        # --- Almacenamiento de resultados ---
+        results_list.append({
+            "ID": image_name,
+            "DM_Total_IA": dm_total_ia,
+            "DM_Der_IA": dm_der_pred, "Vol_TFG_Der_IA": vol_tfg_der_pred, "Vol_Mama_Der_IA": vol_mama_der_pred,
+            "DM_Der_Manual": dm_der_gt, "Vol_TFG_Der_Manual": vol_tfg_der_gt, "Vol_Mama_Der_Manual": vol_mama_der_gt,
+            "DM_Izq_IA": dm_izq_pred, "Vol_TFG_Izq_IA": vol_tfg_izq_pred, "Vol_Mama_Izq_IA": vol_mama_izq_pred,
+            "DM_Izq_Manual": dm_izq_gt, "Vol_TFG_Izq_Manual": vol_tfg_izq_gt, "Vol_Mama_Izq_Manual": vol_mama_izq_gt,
+            "Dice_Mama": dice_mama, "Dice_TFG": dice_tfg,
+            "IoU_Mama": iou_mama, "IoU_TFG": iou_tfg,
+            "HD95_Mama_mm": hd95_mama, "HD95_TFG_mm": hd95_tfg
+        })
+
+        # --- Guardado de máscaras por lado ---
+        nib.save(nib.Nifti1Image(output_mama_der.astype(np.uint8), affine), os.path.join(output_mask_dir, f"{image_name}_mask_mama_der.nii.gz"))
+        nib.save(nib.Nifti1Image(output_mama_izq.astype(np.uint8), affine), os.path.join(output_mask_dir, f"{image_name}_mask_mama_izq.nii.gz"))
+        nib.save(nib.Nifti1Image(output_tfg_der.astype(np.uint8),  affine), os.path.join(output_mask_dir, f"{image_name}_mask_tfg_der.nii.gz"))
+        nib.save(nib.Nifti1Image(output_tfg_izq.astype(np.uint8),  affine), os.path.join(output_mask_dir, f"{image_name}_mask_tfg_izq.nii.gz"))
+
+        from scipy.ndimage import center_of_mass
+       
+    # ANÁLISIS FINAL Y VISUALIZACIÓN
+df_results = pd.DataFrame(results_list)
+csv_out = "resultados_volumetria_testing.csv"
+df_results.to_csv(csv_out, index=False)
+print(f"\n--- Resumen de Resultados guardado en {csv_out} ---")
+print(df_results.head(20))
+import pickle
+viz_output_file = "datos_visualizacion_predicciones.pkl"
+try:
+    with open(viz_output_file, 'wb') as f:
+        pickle.dump(viz_data_list, f)
+    print(f"--- Datos de visualización de {len(viz_data_list)} estudios guardados en {viz_output_file} ---")
+except Exception as e:
+    print(f"ERROR: No se pudo guardar la lista de visualización: {e}")
